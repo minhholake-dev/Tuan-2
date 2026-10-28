@@ -3,27 +3,38 @@
 #include "esp_sleep.h"
 #include "driver/rtc_io.h"
 
-#define BUTTON_PIN1 25
-#define BUTTON_PIN2 26
+#define BUTTON1 25
+#define BUTTON2 26
 #define SLEEP_PIN 33
-
 #define LED1 27
 #define LED2 32
-
 #define DIN 23
 #define CLK 18
 #define CS 5
 
 int count = 0;
-
 bool lastReading = HIGH;
 bool stableState = HIGH;
 bool finished = false;
 
-const uint32_t debounceTime = 50;
-const uint32_t countInterval = 100;
+uint32_t lastDebounce = 0;
+uint32_t lastCount = 0;
 
-// MAX7219
+hw_timer_t *timer;
+volatile bool sleepRequested = false;
+
+// Hardware timer interrupt
+void ARDUINO_ISR_ATTR onTimer() {
+    sleepRequested = true;
+}
+
+// Reset 5-minute inactivity timer
+void resetTimer() {
+    timerWrite(timer, 0);
+    sleepRequested = false;
+}
+
+// Send command to MAX7219
 void matrixWrite(byte address, byte data) {
     digitalWrite(CS, LOW);
     shiftOut(DIN, CLK, MSBFIRST, address);
@@ -31,13 +42,8 @@ void matrixWrite(byte address, byte data) {
     digitalWrite(CS, HIGH);
 }
 
-void clearMatrix() {
-    for (int i = 1; i <= 8; i++) {
-        matrixWrite(i, 0);
-    }
-}
-
-void sadFace() {
+// Display or clear sad face
+void showFace(bool show) {
     byte face[8] = {
         B00000000,
         B00100100,
@@ -49,27 +55,22 @@ void sadFace() {
         B00000000
     };
 
-    for (int i = 0; i < 8; i++) {
-        matrixWrite(i + 1, face[i]);
-    }
+    for (int i = 0; i < 8; i++)
+        matrixWrite(i + 1, show ? face[i] : 0);
 }
 
 // Enter Deep Sleep
 void enterDeepSleep() {
-    Serial.println("Entering Deep Sleep");
-
     digitalWrite(LED1, LOW);
     digitalWrite(LED2, LOW);
-
-    // Put MAX7219 into shutdown mode
     matrixWrite(0x0C, 0);
 
-    // Button 1 will wake the ESP32 when LOW
     rtc_gpio_pullup_en(GPIO_NUM_25);
     rtc_gpio_pulldown_dis(GPIO_NUM_25);
 
     esp_sleep_enable_ext0_wakeup(GPIO_NUM_25, 0);
 
+    Serial.println("Deep Sleep");
     Serial.flush();
     esp_deep_sleep_start();
 }
@@ -77,11 +78,10 @@ void enterDeepSleep() {
 void setup() {
     Serial.begin(115200);
 
-    // Restore GPIO25 after Deep Sleep wakeup
     rtc_gpio_deinit(GPIO_NUM_25);
 
-    pinMode(BUTTON_PIN1, INPUT_PULLUP);
-    pinMode(BUTTON_PIN2, INPUT_PULLUP);
+    pinMode(BUTTON1, INPUT_PULLUP);
+    pinMode(BUTTON2, INPUT_PULLUP);
     pinMode(SLEEP_PIN, INPUT_PULLUP);
 
     pinMode(LED1, OUTPUT);
@@ -93,90 +93,83 @@ void setup() {
     pinMode(DIN, OUTPUT);
     pinMode(CLK, OUTPUT);
     pinMode(CS, OUTPUT);
-
     digitalWrite(CS, HIGH);
 
+    // Initialize LED matrix
     matrixWrite(0x0F, 0);
     matrixWrite(0x09, 0);
     matrixWrite(0x0B, 7);
     matrixWrite(0x0A, 4);
     matrixWrite(0x0C, 1);
+    showFace(false);
 
-    clearMatrix();
+    // Hardware timer: 5 minutes
+    timer = timerBegin(1000000);
+    timerAttachInterrupt(timer, &onTimer);
+    timerAlarm(timer, 300000000ULL, true, 0);
 
-    if (esp_sleep_get_wakeup_cause()
-        == ESP_SLEEP_WAKEUP_EXT0) {
-        Serial.println("Woken by Button 1");
-    } else {
-        Serial.println("ESP32 awake");
-    }
-
-    delay(3000);
+    Serial.println("ESP32 awake");
 }
 
 void loop() {
     uint32_t now = millis();
+    bool reading = digitalRead(BUTTON2);
 
-    // BUTTON 2: DEBOUNCE
-    bool reading = digitalRead(BUTTON_PIN2);
-
-    if (reading != lastReading) {
+    // Debounce Button 2
+    if (reading != lastReading)
         lastDebounce = now;
-    }
 
-    if (now - lastDebounce >= debounceTime) {
-        if (reading != stableState) {
-            stableState = reading;
+    if (now - lastDebounce >= 50 &&
+        reading != stableState) {
 
-            if (stableState == LOW) {
-                count = 0;
-                finished = false;
-                lastCount = now;
+        stableState = reading;
+        resetTimer();
 
-                clearMatrix();
-                digitalWrite(LED2, LOW);
-
-                Serial.println("Hold for gift");
-            }
+        if (stableState == LOW) {
+            count = 0;
+            finished = false;
+            lastCount = now;
+            showFace(false);
+            digitalWrite(LED2, LOW);
+            Serial.println("Hold for gift");
         }
     }
 
     lastReading = reading;
 
-    // BUTTON 2: COUNT
-    if (stableState == LOW && !finished) {
-        if (now - lastCount >= countInterval) {
-            lastCount = now;
-            count++;
+    // Count while Button 2 is held
+    if (stableState == LOW && !finished &&
+        now - lastCount >= 100) {
 
-            Serial.println(count);
+        lastCount = now;
+        resetTimer();
+        count++;
 
-            if (count == 50) {
-                Serial.println("There are no gifts :(");
+        Serial.println(count);
 
-                sadFace();
-                digitalWrite(LED2, HIGH);
-
-                finished = true;
-            }
+        if (count == 50) {
+            Serial.println("There are no gifts :(");
+            showFace(true);
+            digitalWrite(LED2, HIGH);
+            finished = true;
         }
     }
 
-    if (digitalRead(SLEEP_PIN) == LOW &&
-    digitalRead(BUTTON_PIN1) == HIGH) {
+    // Button 1: intentional interference
+    if (digitalRead(BUTTON1) == LOW) {
+        resetTimer();
 
-    enterDeepSleep();
-}
-
-    // BUTTON 1: INTENTIONAL INTERFERENCE
-    if (digitalRead(BUTTON_PIN1) == LOW) {
-        Serial.println("Message received from Button 1");
-        Serial.println("Waiting server response for 3 seconds...");
-
+        Serial.println("Waiting server response...");
         digitalWrite(LED1, HIGH);
-
         delay(3000);
-
         digitalWrite(LED1, LOW);
+    }
+
+    // Deep Sleep after inactivity or GPIO33 LOW
+    if ((sleepRequested ||
+         digitalRead(SLEEP_PIN) == LOW) &&
+        digitalRead(BUTTON1) == HIGH) {
+
+        enterDeepSleep();
     }
 }
